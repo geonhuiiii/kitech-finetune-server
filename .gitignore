@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.venv/
+venv/
+env/
+
+# 데이터/모델 산출물
+data/
+*.pt
+*.safetensors
+
+# 환경 변수
+.env
+.env.local
+
+# 로그
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker Shell Script (임시 다운로드)
+get-docker.sh

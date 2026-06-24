@@ -1,0 +1,39 @@
+services:
+  finetune-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kitech-finetune-server:latest
+    container_name: kitech-finetune-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # 업로드/모델 산출물 저장 루트 (컨테이너 내부 경로)
+      FINETUNE_DATA_DIR: /data
+      # 업로드 최대 크기 (바이트). 기본 5GB
+      FINETUNE_MAX_FILE_SIZE: "5368709120"
+      # 학습 시뮬레이션 파라미터 (실제 학습 연결 시 무시됨)
+      FINETUNE_SIM_EPOCHS: "10"
+      FINETUNE_SIM_EPOCH_SECONDS: "3"
+      # CORS 허용 출처 (쉼표 구분). 기본 전체 허용
+      FINETUNE_CORS_ORIGINS: "*"
+      # 모델 다운로드 절대 URL이 필요하면 외부에서 접근 가능한 베이스 URL 지정
+      # FINETUNE_PUBLIC_BASE_URL: "http://10.241.120.217:8000"
+    volumes:
+      - finetune-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  finetune-data:
+    driver: local

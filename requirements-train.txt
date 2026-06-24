@@ -1,0 +1,7 @@
+# 실제 학습(torch) 의존성 — 설치 시 jobs_engine 이 자동으로 실제 학습 모드로 전환됩니다.
+# CPU 전용 설치 예:
+#   pip install -r requirements-train.txt --index-url https://download.pytorch.org/whl/cpu
+# 미설치 시 서버는 시뮬레이션 학습으로 폴백합니다.
+torch>=2.2
+torchvision>=0.17
+pillow>=10.0
