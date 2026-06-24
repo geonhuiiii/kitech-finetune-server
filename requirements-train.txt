@@ -1,8 +1,25 @@
 # 실제 학습(torch) 의존성 — 설치 시 jobs_engine 이 자동으로 실제 학습 모드로 전환됩니다.
-# CPU 전용 설치 예:
+# 전체 설치:
+#   pip install -r requirements-train.txt
+# CPU 전용 PyTorch:
 #   pip install -r requirements-train.txt --index-url https://download.pytorch.org/whl/cpu
 # 미설치 시 서버는 시뮬레이션 학습으로 폴백합니다.
+
+# ── 이미지 (image_classification / segmentation / anomaly) ─────────────────
 torch>=2.2
 torchvision>=0.17
 pillow>=10.0
 timm>=1.0.0
+numpy>=1.24
+
+# ── 이미지 탐지 ─────────────────────────────────────────────────────────────
+ultralytics>=8.3        # YOLO26n — 자동 다운로드
+pyyaml>=6.0
+
+# ── 시계열 / JSON ───────────────────────────────────────────────────────────
+pandas>=2.0
+scikit-learn>=1.3
+xgboost>=2.0          # json_classification, json_regression (sklearn fallback 포함)
+
+# ── 이미지 이상탐지 검증 (선택) ────────────────────────────────────────────
+# scikit-learn 에 roc_auc_score 포함됨 — 별도 설치 불필요

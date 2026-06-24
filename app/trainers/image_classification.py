@@ -16,9 +16,9 @@ _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 # backboneModelId → (timm model name, input size)
 # pretrained=True 시 timm 이 허깅페이스/공식 URL 에서 가중치를 자동 다운로드합니다.
 _BACKBONE_MAP: dict[str, tuple[str, int]] = {
-    "convnext_v2_b":    ("convnextv2_base.fcmae_ft_in22k_in1k", 224),
-    "efficientnet_v2_m": ("efficientnetv2_m.in21k_ft_in1k",      224),
-    "swin_v2_b":        ("swinv2_base_window8_256.ms_in1k",      256),
+    "convnext_v2_b":    ("convnext_base.clip_laion2b_augreg_ft_in1k", 224),
+    "efficientnet_v2_m": ("tf_efficientnetv2_m.in21k_ft_in1k",        224),
+    "swin_v2_b":        ("swinv2_base_window8_256.ms_in1k",           256),
 }
 _FALLBACK_BACKBONE = ("resnet18", 64)   # timm 없거나 미등록 모델 폴백
 
