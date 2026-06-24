@@ -27,8 +27,8 @@ echo "=== [3/4] torch CPU 설치 (CUDA 충돌 회피) ==="
 micromamba run -n "${ENV_NAME}" pip install \
   torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-echo "=== [4/4] pillow 설치 ==="
-micromamba run -n "${ENV_NAME}" pip install pillow
+echo "=== [4/4] pillow + timm 설치 ==="
+micromamba run -n "${ENV_NAME}" pip install pillow "timm>=1.0.0"
 
 echo ""
 echo "=== 설치 검증 ==="

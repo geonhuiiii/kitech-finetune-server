@@ -1,12 +1,7 @@
-"""이미지 분류 실제 파인튜닝 트레이너 (torchvision).
+"""이미지 분류 실제 파인튜닝 트레이너 (timm 기반).
 
-데이터 소스: 업로드 세션 디렉터리의 `class_*` 폴더 (DatasetUploadStep 의 role=class_<name>).
-  {dataset_dir}/class_crack/img001.jpg
-  {dataset_dir}/class_normal/img101.jpg
-
-가벼운 ResNet18 백본을 사용하고, 사전학습 가중치 다운로드가 가능하면 전이학습,
-불가하면 무작위 초기화로 학습합니다(오프라인/사내망에서도 동작).
-CPU 에서도 빠르게 돌도록 입력 64x64, 소규모 배치로 구성합니다.
+선택된 backboneModelId 에 맞는 모델을 timm 으로 로드합니다.
+사전학습 가중치 다운로드 실패 시 무작위 초기화로 폴백합니다.
 """
 from __future__ import annotations
 
@@ -17,16 +12,23 @@ from ..schemas import JobRequest
 from .base import LogFn, ProgressFn, TrainResult
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
-_INPUT_SIZE = 64
+
+# backboneModelId → (timm model name, input size)
+# pretrained=True 시 timm 이 허깅페이스/공식 URL 에서 가중치를 자동 다운로드합니다.
+_BACKBONE_MAP: dict[str, tuple[str, int]] = {
+    "convnext_v2_b":    ("convnextv2_base.fcmae_ft_in22k_in1k", 224),
+    "efficientnet_v2_m": ("efficientnetv2_m.in21k_ft_in1k",      224),
+    "swin_v2_b":        ("swinv2_base_window8_256.ms_in1k",      256),
+}
+_FALLBACK_BACKBONE = ("resnet18", 64)   # timm 없거나 미등록 모델 폴백
 
 
 class ImageClassificationTrainer:
     def is_available(self) -> bool:
         try:
-            import torch  # noqa: F401
-            import torchvision  # noqa: F401
+            import torch       # noqa: F401
+            import torchvision # noqa: F401
             from PIL import Image  # noqa: F401
-
             return True
         except Exception:
             return False
@@ -45,13 +47,26 @@ class ImageClassificationTrainer:
         import torch
         import torch.nn as nn
         from torch.utils.data import DataLoader, Dataset
-        from torchvision import models, transforms
-        from PIL import Image
+        from torchvision import transforms
+        from PIL import Image as PILImage
 
         torch.manual_seed(42)
         random.seed(42)
 
-        # ── 1) class_* 폴더에서 (경로, 라벨) 수집 ────────────────────────────
+        # ── 1) 백본 결정 ─────────────────────────────────────────────────────
+        backbone_id = req.backboneModelId
+        timm_name, input_size = _BACKBONE_MAP.get(backbone_id, _FALLBACK_BACKBONE)
+
+        # timm 사용 가능 여부 확인
+        try:
+            import timm as _timm  # noqa: F401
+            use_timm = True
+        except ImportError:
+            use_timm = False
+
+        log(f"[init] backbone_id={backbone_id}, timm={use_timm}, arch={timm_name}, input={input_size}px")
+
+        # ── 2) class_* 폴더에서 (경로, 라벨) 수집 ───────────────────────────
         class_dirs = sorted(
             d for d in dataset_dir.iterdir() if d.is_dir() and d.name.startswith("class_")
         ) if dataset_dir.exists() else []
@@ -75,119 +90,129 @@ class ImageClassificationTrainer:
         random.shuffle(samples)
         log(f"[data] 클래스 {len(class_names)}개({', '.join(class_names)}), 총 {len(samples)}장")
 
-        # ── 2) Train/Val 분할 (80/20, 최소 1장씩) ───────────────────────────
+        # ── 3) Train/Val 분할 (80/20) ────────────────────────────────────────
         n_val = max(1, int(len(samples) * 0.2))
         val_samples = samples[:n_val]
         train_samples = samples[n_val:] or samples
         log(f"[data] train {len(train_samples)} / val {len(val_samples)}")
 
         mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
+        std  = [0.229, 0.224, 0.225]
         tf = transforms.Compose([
-            transforms.Resize((_INPUT_SIZE, _INPUT_SIZE)),
+            transforms.Resize((input_size, input_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
         ])
 
-        class _ImageDataset(Dataset):
+        class _DS(Dataset):
             def __init__(self, items: list[tuple[Path, int]]):
                 self.items = items
-
             def __len__(self) -> int:
                 return len(self.items)
-
             def __getitem__(self, idx: int):
                 path, label = self.items[idx]
-                img = Image.open(path).convert("RGB")
+                img = PILImage.open(path).convert("RGB")
                 return tf(img), label
 
         batch_size = min(16, max(2, len(train_samples)))
-        train_loader = DataLoader(_ImageDataset(train_samples), batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(_ImageDataset(val_samples), batch_size=batch_size, shuffle=False)
+        train_loader = DataLoader(_DS(train_samples), batch_size=batch_size, shuffle=True)
+        val_loader   = DataLoader(_DS(val_samples),   batch_size=batch_size, shuffle=False)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        log(f"[init] device={device.type}, backbone=resnet18, epochs={total_epochs}")
+        n_cls  = len(class_names)
 
-        # ── 3) 모델 구성 (사전학습 시도 → 실패 시 무작위 초기화) ─────────────
-        try:
-            weights = models.ResNet18_Weights.DEFAULT
-            model = models.resnet18(weights=weights)
-            log("[init] ImageNet 사전학습 가중치 로드 → 전이학습")
-        except Exception as exc:  # 다운로드 실패/오프라인
-            model = models.resnet18(weights=None)
-            log(f"[init] 사전학습 가중치 사용 불가({exc}) → 무작위 초기화 학습")
-
-        model.fc = nn.Linear(model.fc.in_features, len(class_names))
+        # ── 4) 모델 로드 ─────────────────────────────────────────────────────
+        model = _load_model(timm_name, n_cls, use_timm, log)
         model = model.to(device)
 
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
         final_train_loss = 0.0
-        final_val_loss = 0.0
+        final_val_loss   = 0.0
 
-        # ── 4) 학습 루프 ────────────────────────────────────────────────────
+        # ── 5) 학습 루프 ─────────────────────────────────────────────────────
         for epoch in range(1, total_epochs + 1):
             model.train()
-            running = 0.0
-            n = 0
+            running, n = 0.0, 0
             for xb, yb in train_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 optimizer.zero_grad()
-                out = model(xb)
-                loss = criterion(out, yb)
+                loss = criterion(model(xb), yb)
                 loss.backward()
                 optimizer.step()
                 running += loss.item() * xb.size(0)
                 n += xb.size(0)
             train_loss = round(running / max(1, n), 4)
 
-            # 검증
             model.eval()
-            v_running = 0.0
-            v_n = 0
-            correct = 0
+            v_running, v_n, correct = 0.0, 0, 0
             with torch.no_grad():
                 for xb, yb in val_loader:
                     xb, yb = xb.to(device), yb.to(device)
                     out = model(xb)
-                    loss = criterion(out, yb)
-                    v_running += loss.item() * xb.size(0)
+                    v_running += criterion(out, yb).item() * xb.size(0)
                     v_n += xb.size(0)
                     correct += (out.argmax(1) == yb).sum().item()
             val_loss = round(v_running / max(1, v_n), 4)
-            val_acc = round(correct / max(1, v_n), 4)
+            val_acc  = round(correct / max(1, v_n), 4)
 
             final_train_loss, final_val_loss = train_loss, val_loss
             log(f"Epoch {epoch}/{total_epochs} - loss: {train_loss} - val_loss: {val_loss} - val_acc: {val_acc}")
             progress({
                 "type": "progress",
-                "epoch": epoch,
-                "totalEpochs": total_epochs,
-                "trainLoss": train_loss,
-                "valLoss": val_loss,
-                "valAcc": val_acc,
+                "epoch": epoch, "totalEpochs": total_epochs,
+                "trainLoss": train_loss, "valLoss": val_loss, "valAcc": val_acc,
             })
 
-        # ── 5) 산출물 저장 ──────────────────────────────────────────────────
+        # ── 6) 저장 ──────────────────────────────────────────────────────────
         models_dir.mkdir(parents=True, exist_ok=True)
         out_path = models_dir / f"{job_id}_finetuned.pt"
-        torch.save(
-            {
-                "state_dict": model.state_dict(),
-                "class_names": class_names,
-                "arch": "resnet18",
-                "input_size": _INPUT_SIZE,
-                "normalize": {"mean": mean, "std": std},
-                "jobId": job_id,
-                "backboneModelId": req.backboneModelId,
-            },
-            out_path,
-        )
-        log("[done] 실제 학습 완료 — state_dict 저장됨")
+        torch.save({
+            "state_dict": model.state_dict(),
+            "class_names": class_names,
+            "arch": timm_name,
+            "input_size": input_size,
+            "normalize": {"mean": mean, "std": std},
+            "jobId": job_id,
+            "backboneModelId": backbone_id,
+        }, out_path)
+        log(f"[done] 학습 완료 — arch={timm_name}, 저장: {out_path.name}")
         return TrainResult(
             model_path=out_path,
             final_train_loss=final_train_loss,
             final_val_loss=final_val_loss,
-            extra={"class_names": class_names},
+            extra={"class_names": class_names, "arch": timm_name},
         )
+
+
+def _load_model(timm_name: str, n_cls: int, use_timm: bool, log: LogFn):
+    """timm 으로 선택된 백본을 로드. 실패 시 torchvision ResNet18 으로 폴백."""
+    import torch.nn as nn
+
+    if use_timm:
+        import timm
+        # 사전학습 가중치 시도
+        try:
+            model = timm.create_model(timm_name, pretrained=True, num_classes=n_cls)
+            log(f"[init] timm '{timm_name}' 사전학습 가중치 로드 완료 (전이학습)")
+            return model
+        except Exception as e:
+            log(f"[init] 사전학습 가중치 다운로드 실패({e}) → 무작위 초기화")
+            try:
+                model = timm.create_model(timm_name, pretrained=False, num_classes=n_cls)
+                log(f"[init] timm '{timm_name}' 무작위 초기화")
+                return model
+            except Exception as e2:
+                log(f"[init] timm 모델 생성 실패({e2}) → resnet18 폴백")
+
+    # torchvision ResNet18 최종 폴백
+    from torchvision import models
+    try:
+        m = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        log("[init] resnet18 사전학습 가중치 로드 (폴백)")
+    except Exception:
+        m = models.resnet18(weights=None)
+        log("[init] resnet18 무작위 초기화 (폴백)")
+    m.fc = nn.Linear(m.fc.in_features, n_cls)
+    return m
