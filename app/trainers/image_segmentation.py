@@ -82,11 +82,10 @@ class ImageSegmentationTrainer:
 
         log(f"[data] {len(pairs)}쌍, 클래스 {nc}개")
 
-        # ── 분할 80/20 ───────────────────────────────────────────────────
-        random.shuffle(pairs)
-        n_val = max(1, int(len(pairs) * 0.2))
-        val_pairs = pairs[:n_val]
-        train_pairs = pairs[n_val:] or pairs
+        # ── 소량 여부 → K-Fold or 80/20 ─────────────────────────────────
+        _SMALL = 20
+        is_small = len(pairs) < _SMALL
+        n_folds  = max(2, min(5, len(pairs))) if is_small else 1
 
         input_size = 256
         img_tf = transforms.Compose([
@@ -108,69 +107,129 @@ class ImageSegmentationTrainer:
                 mask_t = torch.as_tensor(np.array(mask), dtype=torch.long).clamp(0, nc - 1)
                 return img, mask_t
 
-        bs = min(8, max(2, len(train_pairs)))
-        train_loader = DataLoader(_DS(train_pairs), batch_size=bs, shuffle=True)
-        val_loader   = DataLoader(_DS(val_pairs),   batch_size=bs, shuffle=False)
-
-        # ── FCN-ResNet50 ─────────────────────────────────────────────────
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        try:
-            model = models.segmentation.fcn_resnet50(
-                weights=models.segmentation.FCN_ResNet50_Weights.DEFAULT
-            )
-            log("[init] FCN-ResNet50 사전학습 가중치 로드 완료")
-        except Exception as e:
-            log(f"[init] 사전학습 가중치 로드 실패({e}) → 무작위 초기화")
-            model = models.segmentation.fcn_resnet50(weights=None)
-
-        # classifier head 교체
-        model.classifier[4] = nn.Conv2d(512, nc, kernel_size=1)
-        model = model.to(device)
-
+        device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-        final_train_loss = 0.0
-        final_val_loss = 0.0
+        def _make_model():
+            try:
+                m = models.segmentation.fcn_resnet50(
+                    weights=models.segmentation.FCN_ResNet50_Weights.DEFAULT
+                )
+            except Exception:
+                m = models.segmentation.fcn_resnet50(weights=None)
+            m.classifier[4] = nn.Conv2d(512, nc, kernel_size=1)
+            return m.to(device)
 
-        for epoch in range(1, total_epochs + 1):
-            model.train()
-            running, n = 0.0, 0
-            for imgs, masks in train_loader:
-                imgs, masks = imgs.to(device), masks.to(device)
-                optimizer.zero_grad()
-                out = model(imgs)["out"]
-                # 출력 크기 → 마스크 크기에 맞게 보간
-                if out.shape[-2:] != masks.shape[-2:]:
-                    import torch.nn.functional as F
-                    out = F.interpolate(out, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-                loss = criterion(out, masks)
-                loss.backward()
-                optimizer.step()
-                running += loss.item() * imgs.size(0)
-                n += imgs.size(0)
-            train_loss = round(running / max(1, n), 4)
-
-            model.eval()
-            v_running, v_n = 0.0, 0
-            with torch.no_grad():
-                for imgs, masks in val_loader:
+        def _run_epoch(model, loader, optimizer=None):
+            """단일 epoch 학습(optimizer 있음) 또는 검증(None)."""
+            import torch.nn.functional as F
+            is_train = optimizer is not None
+            model.train() if is_train else model.eval()
+            total, cnt = 0.0, 0
+            ctx = torch.enable_grad() if is_train else torch.no_grad()
+            with ctx:
+                for imgs, masks in loader:
                     imgs, masks = imgs.to(device), masks.to(device)
+                    if is_train:
+                        optimizer.zero_grad()
                     out = model(imgs)["out"]
                     if out.shape[-2:] != masks.shape[-2:]:
-                        import torch.nn.functional as F
-                        out = F.interpolate(out, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-                    v_running += criterion(out, masks).item() * imgs.size(0)
-                    v_n += imgs.size(0)
-            val_loss = round(v_running / max(1, v_n), 4)
-            final_train_loss, final_val_loss = train_loss, val_loss
+                        out = F.interpolate(out, size=masks.shape[-2:],
+                                            mode="bilinear", align_corners=False)
+                    loss = criterion(out, masks)
+                    if is_train:
+                        loss.backward()
+                        optimizer.step()
+                    total += loss.item() * imgs.size(0)
+                    cnt   += imgs.size(0)
+            return round(total / max(1, cnt), 4)
 
-            log(f"Epoch {epoch}/{total_epochs} - loss: {train_loss} - val_loss: {val_loss}")
-            progress({
-                "type": "progress",
-                "epoch": epoch, "totalEpochs": total_epochs,
-                "trainLoss": train_loss, "valLoss": val_loss,
-            })
+        final_train_loss = 0.0
+        final_val_loss   = 0.0
+
+        # ── K-Fold (소량) ────────────────────────────────────────────────
+        if is_small:
+            log(f"[data] 소량 데이터({len(pairs)}쌍) → {n_folds}-Fold CV")
+            shuffled = list(pairs)
+            random.shuffle(shuffled)
+            fold_bins = [shuffled[i::n_folds] for i in range(n_folds)]
+
+            epochs_per_fold = max(1, total_epochs // n_folds)
+            fold_val_losses: list[float] = []
+
+            for fold_idx, val_bin in enumerate(fold_bins):
+                train_p = [x for i, b in enumerate(fold_bins) for x in b if i != fold_idx]
+                log(f"[fold {fold_idx+1}/{n_folds}] train={len(train_p)}, val={len(val_bin)}")
+
+                bs           = min(8, max(2, len(train_p)))
+                train_loader = DataLoader(_DS(train_p),  batch_size=bs, shuffle=True)
+                val_loader_f = DataLoader(_DS(val_bin),  batch_size=bs, shuffle=False)
+
+                model     = _make_model()
+                optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+                best_val = float("inf")
+                for ep in range(1, epochs_per_fold + 1):
+                    t_loss = _run_epoch(model, train_loader, optimizer)
+                    v_loss = _run_epoch(model, val_loader_f)
+                    best_val = min(best_val, v_loss)
+                    global_ep = fold_idx * epochs_per_fold + ep
+                    log(f"[fold {fold_idx+1}] Epoch {ep}/{epochs_per_fold} "
+                        f"- loss: {t_loss} - val_loss: {v_loss}")
+                    progress({
+                        "type": "progress",
+                        "epoch": global_ep,
+                        "totalEpochs": n_folds * epochs_per_fold,
+                        "trainLoss": t_loss, "valLoss": v_loss,
+                    })
+                fold_val_losses.append(best_val)
+
+            mean_val = round(sum(fold_val_losses) / len(fold_val_losses), 4)
+            log(f"[CV] {n_folds}-Fold 평균 val_loss={mean_val:.4f}")
+
+            # 최종 모델: 전체 데이터로 재학습
+            log("[final] 전체 데이터로 최종 모델 학습 중...")
+            model     = _make_model()
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+            all_loader = DataLoader(_DS(shuffled), batch_size=min(8, len(shuffled)), shuffle=True)
+            for ep in range(1, total_epochs + 1):
+                t_loss = _run_epoch(model, all_loader, optimizer)
+                progress({
+                    "type": "progress",
+                    "epoch": n_folds * epochs_per_fold + ep,
+                    "totalEpochs": n_folds * epochs_per_fold + total_epochs,
+                    "trainLoss": t_loss, "valLoss": mean_val,
+                })
+            final_train_loss = t_loss
+            final_val_loss   = mean_val
+
+        # ── 일반 80/20 ───────────────────────────────────────────────────
+        else:
+            random.shuffle(pairs)
+            n_val       = max(1, int(len(pairs) * 0.2))
+            val_pairs   = pairs[:n_val]
+            train_pairs = pairs[n_val:]
+            log(f"[data] 80/20 split -> train {len(train_pairs)} / val {len(val_pairs)}")
+
+            bs           = min(8, max(2, len(train_pairs)))
+            train_loader = DataLoader(_DS(train_pairs), batch_size=bs, shuffle=True)
+            val_loader   = DataLoader(_DS(val_pairs),   batch_size=bs, shuffle=False)
+
+            model     = _make_model()
+            log("[init] FCN-ResNet50 로드 완료")
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+            for epoch in range(1, total_epochs + 1):
+                train_loss = _run_epoch(model, train_loader, optimizer)
+                val_loss   = _run_epoch(model, val_loader)
+                final_train_loss, final_val_loss = train_loss, val_loss
+
+                log(f"Epoch {epoch}/{total_epochs} - loss: {train_loss} - val_loss: {val_loss}")
+                progress({
+                    "type": "progress",
+                    "epoch": epoch, "totalEpochs": total_epochs,
+                    "trainLoss": train_loss, "valLoss": val_loss,
+                })
 
         models_dir.mkdir(parents=True, exist_ok=True)
         out_path = models_dir / f"{job_id}_finetuned.pt"
