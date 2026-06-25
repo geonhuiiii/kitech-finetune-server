@@ -167,13 +167,20 @@ class TimeseriesClassificationTrainer:
 
             log(f"[data] Stratified split → train {len(X_train)} / val {len(X_val)}")
 
+            best_val_acc_so_far = -1.0
+            best_clf            = None
+
             for i in range(1, total_epochs + 1):
                 n = min(step * i, n_est)
                 clf = _make_clf(n)
                 clf.fit(X_train, y_train)
                 t_acc = accuracy_score(y_train, clf.predict(X_train))
                 v_acc = accuracy_score(y_val,   clf.predict(X_val))
-                log(f"Epoch {i}/{total_epochs} - acc: {t_acc:.4f} - val_acc: {v_acc:.4f}")
+                if v_acc > best_val_acc_so_far:
+                    best_val_acc_so_far = v_acc
+                    best_clf            = clf
+                log(f"Epoch {i}/{total_epochs} - acc: {t_acc:.4f} - val_acc: {v_acc:.4f}"
+                    + (" ★" if v_acc == best_val_acc_so_far else ""))
                 progress({
                     "type": "progress",
                     "epoch": i, "totalEpochs": total_epochs,
@@ -182,10 +189,10 @@ class TimeseriesClassificationTrainer:
                     "valAcc":    round(v_acc, 4),
                 })
 
-            clf = _make_clf(n_est)
-            clf.fit(X_train, y_train)
+            clf             = best_clf
             final_train_acc = accuracy_score(y_train, clf.predict(X_train))
-            final_val_loss  = round(1 - accuracy_score(y_val, clf.predict(X_val)), 4)
+            final_val_loss  = round(1 - best_val_acc_so_far, 4)
+            log(f"[best] val_acc={best_val_acc_so_far:.4f} 모델 선택")
 
         # ── 저장 ─────────────────────────────────────────────────────────
         models_dir.mkdir(parents=True, exist_ok=True)

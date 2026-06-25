@@ -219,17 +219,30 @@ class ImageSegmentationTrainer:
             log("[init] FCN-ResNet50 로드 완료")
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
+            best_val_loss_so_far = float("inf")
+            best_state           = None
+
             for epoch in range(1, total_epochs + 1):
                 train_loss = _run_epoch(model, train_loader, optimizer)
                 val_loss   = _run_epoch(model, val_loader)
                 final_train_loss, final_val_loss = train_loss, val_loss
 
-                log(f"Epoch {epoch}/{total_epochs} - loss: {train_loss} - val_loss: {val_loss}")
+                if val_loss < best_val_loss_so_far:
+                    best_val_loss_so_far = val_loss
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+                log(f"Epoch {epoch}/{total_epochs} - loss: {train_loss} - val_loss: {val_loss}"
+                    + (" ★" if val_loss == best_val_loss_so_far else ""))
                 progress({
                     "type": "progress",
                     "epoch": epoch, "totalEpochs": total_epochs,
                     "trainLoss": train_loss, "valLoss": val_loss,
                 })
+
+            if best_state is not None:
+                model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+                log(f"[best] val_loss={best_val_loss_so_far:.4f} 모델 복원")
+            final_val_loss = best_val_loss_so_far
 
         models_dir.mkdir(parents=True, exist_ok=True)
         out_path = models_dir / f"{job_id}_finetuned.pt"
